@@ -1,6 +1,22 @@
 
 ##  Release notes
 
+### Version 1.5.1 Release Notes
++ Enhancement: Now supports integration of all Lightning hooks into the Neuromancer Lightning trainer. Please refer to Lightning examples README for more information
++ Deprecated WandB hyperparameter tuning via `LitTrainer` for now 
++ New feature: TorchSDE integration with Neuromancer core library, namely `torchsde.sdeint()`. Motivating example for system ID on stochastic process found in examples/sdes/sde_walkthrough.ipynb
++ New feature: Stacked physics-informed neural networks 
++ New feature: SINDy -- sparse system identification of nonlinear dynamical systems
++ New feature: differentiable proximal operators in operator splitting methods for learning to optimize
+
+### Version 1.5.0 Release Notes 
++ New Feature: PyTorch Lightning Integration with NeuroMANCER core library. All these features are opt-in. 
+  + Code simplifications: zero boilerplate code, increased modularity 
+  + Added ability for user to define custom training logic 
+  + Easy support for GPU and multi-GPU training
+  + Easy Weights and Biases (https://wandb.ai/site) hyperparameter tuning and Tensorboard Logging
+
+
 ### Version 1.4.2 Release Notes 
 + New feature: Update violation energy for projected gradient #110 (based on idea #86).
 + Reverted `psl.nonautonomous.TwoTank` `(umin, umax)` bounds to `(0.5, 0.5)` for numerical stability #105

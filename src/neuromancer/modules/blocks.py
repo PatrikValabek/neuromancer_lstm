@@ -6,18 +6,24 @@ Neural network module building blocks for neural state space models, state estim
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 from abc import ABC, abstractmethod
 
 import neuromancer.slim as slim
 from neuromancer.slim.linear import Linear  # assuming `slim.Linear` is imported this way
 import neuromancer.modules.rnn as rnn
 from neuromancer.modules.activations import soft_exp, SoftExponential, SmoothedReLU
+from neuromancer.modules.functions import bounds_clamp, bounds_scaling
+
+
 
 
 class Block(nn.Module, ABC):
     """
     Canonical abstract class of the block function approximator
     """
+
     def __init__(self):
         super().__init__()
 
@@ -37,12 +43,14 @@ class Block(nn.Module, ABC):
         else:
             x = inputs[0]
         return self.block_eval(x)
-
+       
+    
 
 class Linear(Block):
     """
     Linear map consistent with block interface
     """
+
     def __init__(
         self,
         insize,
@@ -96,17 +104,22 @@ class Dropout(Block):
         self.at_test = at_test
 
     def block_eval(self, x):
-        use_dropout = (self.training and self.at_train) or (not self.training and self.at_test)
+        use_dropout = (self.training and self.at_train) or (
+            not self.training and self.at_test
+        )
         return torch.nn.functional.dropout(x, p=self.p, training=use_dropout)
 
 
 def set_model_dropout_mode(model, at_train=None, at_test=None):
-    """Change dropout mode, useful for enabling MC sampling during inference time.
-    """
+    """Change dropout mode, useful for enabling MC sampling during inference time."""
+
     def _apply_fn(x):
-        if type(x) == Dropout:
-            if at_test is not None: x.at_test = at_test
-            if at_train is not None: x.at_train = at_train
+        if isinstance(x, Dropout):
+            if at_test is not None:
+                x.at_test = at_test
+            if at_train is not None:
+                x.at_train = at_train
+
     model.apply(_apply_fn)
 
 class LSTMBlock(nn.Module):
@@ -150,6 +163,7 @@ class MLP(Block):
     """
     Multi-Layer Perceptron consistent with blocks interface
     """
+
     def __init__(
         self,
         insize,
@@ -175,7 +189,9 @@ class MLP(Block):
         self.in_features, self.out_features = insize, outsize
         self.nhidden = len(hsizes)
         sizes = [insize] + hsizes + [outsize]
-        self.nonlin = nn.ModuleList([nonlin() for k in range(self.nhidden)] + [nn.Identity()])
+        self.nonlin = nn.ModuleList(
+            [nonlin() for k in range(self.nhidden)] + [nn.Identity()]
+        )
         self.linear = nn.ModuleList(
             [
                 linear_map(sizes[k], sizes[k + 1], bias=bias, **linargs)
@@ -325,13 +341,78 @@ def relu_clamp(x, min, max):
     x = x - torch.relu(x - max)
     return x
 
+    def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
+        return sum(
+            layer.regularization_loss(regularize_activation, regularize_entropy)
+            for layer in self.layers
+        )
+
+
+class KANBlock(Block):
+    def __init__(
+        self,
+        insize,
+        outsize,
+        num_layers=1,
+        hidden_size=None,
+        grid_size=5,
+        spline_order=3,
+        scale_noise=0.1,
+        scale_base=1.0,
+        scale_spline=1.0,
+        enable_standalone_scale_spline=True,
+        base_activation=torch.nn.SiLU,
+        grid_eps=0.02,
+        grid_range=[-1, 1],
+    ):
+        super().__init__()
+        self.in_features = insize
+        self.out_features = outsize
+        self.kan_layers = nn.ModuleList()
+
+        if hidden_size is None:
+            hidden_size = outsize
+
+        layer_sizes = [insize] + [hidden_size] * (num_layers - 1) + [outsize]
+        for in_features, out_features in zip(layer_sizes[:-1], layer_sizes[1:]):
+            self.kan_layers.append(
+                KANLinear(
+                    in_features,
+                    out_features,
+                    grid_size=grid_size,
+                    spline_order=spline_order,
+                    scale_noise=scale_noise,
+                    scale_base=scale_base,
+                    scale_spline=scale_spline,
+                    enable_standalone_scale_spline=enable_standalone_scale_spline,
+                    base_activation=base_activation,
+                    grid_eps=grid_eps,
+                    grid_range=grid_range,
+                )
+            )
+
+    def block_eval(self, x):
+        for layer in self.kan_layers:
+            x = layer(x)
+        return x
+
+    def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
+        return sum(
+            layer.regularization_loss(regularize_activation, regularize_entropy)
+            for layer in self.kan_layers
+        )
+
+    def update_grid(self, x: torch.Tensor, margin=0.01):
+        for layer in self.kan_layers:
+            layer.update_grid(x, margin=margin)
+
 
 class MLP_bounds(MLP):
     """
     Multi-Layer Perceptron consistent with blocks interface
     """
-    bound_methods = {'sigmoid_scale': sigmoid_scale,
-                    'relu_clamp': relu_clamp}
+
+    bound_methods = {"sigmoid_scale": bounds_scaling, "relu_clamp": bounds_clamp}
 
     def __init__(
         self,
@@ -344,7 +425,7 @@ class MLP_bounds(MLP):
         linargs=dict(),
         min=0.0,
         max=1.0,
-        method='sigmoid_scale',
+        method="sigmoid_scale",
     ):
         """
 
@@ -357,9 +438,17 @@ class MLP_bounds(MLP):
         :param linargs: (dict) Arguments for instantiating linear layer
         :param dropout: (float) Dropout probability
         """
-        super().__init__(insize=insize, outsize=outsize, bias=bias,
-                         linear_map=linear_map, nonlin=nonlin,
-                         hsizes=hsizes, linargs=linargs)
+
+        super().__init__(
+            insize=insize,
+            outsize=outsize,
+            bias=bias,
+            linear_map=linear_map,
+            nonlin=nonlin,
+            hsizes=hsizes,
+            linargs=linargs,
+        )
+
         self.min = min
         self.max = max
         self.method = self._set_method(method)
@@ -368,9 +457,10 @@ class MLP_bounds(MLP):
         if method in self.bound_methods.keys():
             return self.bound_methods[method]
         else:
-            assert callable(method), \
-                f'Method, {method} must be a key in {self.bound_methods} ' \
-                f'or a differentiable callable.'
+            assert callable(method), (
+                f"Method, {method} must be a key in {self.bound_methods} "
+                f"or a differentiable callable."
+            )
             return method
 
     def block_eval(self, x):
@@ -382,13 +472,114 @@ class MLP_bounds(MLP):
         for lin, nlin in zip(self.linear, self.nonlin):
             x = nlin(lin(x))
         return self.method(x, self.min, self.max)
+        
 
+class StackedMLP(Block):
+    """
+    Stacked Multi-Layer Perceptron (MFMLP) designed for multi-fidelity learning where multiple layers are
+    stacked to refine the prediction progressively. Each layer is a blend of linear and nonlinear transformations
+    controlled by an adaptive parameter alpha, influencing the trade-off between the two.
+
+    Attributes:
+        insize (int): Input feature dimension.
+        outsize (int): Output feature dimension.
+        bias (bool): If True, bias is used in linear transformations.
+        linear_map (class): Linear map class used for layers, by default set to slim.Linear.
+        nonlin (callable): Nonlinear activation function applied after linear transformations.
+        h_sf_size (list of int): Sizes of hidden layers in the single-fidelity MLP.
+        n_stacked_mf_layers (int): Number of stacked multi-fidelity layers.
+        h_linear_sizes (list of int): Sizes of hidden layers in each linear sub-network within the multi-fidelity layers.
+        h_nonlinear_sizes (list of int): Sizes of hidden layers in each nonlinear sub-network within the multi-fidelity layers.
+        linargs (dict): Additional arguments for the linear layer instantiation.
+        alpha_init (float): Initial value of alpha parameter controlling linear-nonlinear blend.
+        verbose (bool): If True, print messages about network progress and actions.
+    """
+
+    def __init__(
+        self,
+        insize,
+        outsize,
+        bias=True,
+        linear_map=Linear,
+        nonlin=nn.Tanh,
+        h_sf_size=[20, 20],
+        n_stacked_mf_layers=3,
+        h_linear_sizes=[10, 10],
+        h_nonlinear_sizes=[20, 20],
+        linargs=dict(), 
+        alpha_init=0.1,
+        verbose=False
+    ):
+        super().__init__()
+        self.in_features, self.out_features = insize, outsize
+        self.num_layers = n_stacked_mf_layers
+        self.current_block = 0
+        self.current_epoch = 0
+        self.alpha = nn.ParameterList([nn.Parameter(torch.tensor(alpha_init), requires_grad=True) for _ in range(n_stacked_mf_layers)])
+        self.alpha_loss = 0.0
+        self.verbose = verbose
+        
+        # Initialize the first layer (single-fidelity MLP)
+        self.first_layer = MLP(
+            insize, outsize, bias=bias, linear_map=linear_map, nonlin=nonlin, hsizes=h_sf_size, linargs=linargs
+        )
+    
+        # Initialize subsequent layers (multi-fidelity)
+        self.layers = nn.ModuleList()
+        for i in range(n_stacked_mf_layers):
+            self.layers.append(
+                nn.ModuleDict(
+                    {
+                        "linear": MLP(outsize, outsize, bias=True, linear_map=linear_map, nonlin=nn.Identity, hsizes=h_linear_sizes, linargs=linargs),
+                        "nonlinear": MLP(
+                            insize + outsize,
+                            outsize,
+                            bias=bias,
+                            linear_map=linear_map,
+                            nonlin=nonlin,
+                            hsizes=h_nonlinear_sizes,
+                            linargs=linargs,
+                        ),
+                    }
+                )
+            )
+
+    def block_eval(self, x):
+        """
+        Process input through the multi-fidelity network blocks up to the current block, combining the outputs
+        of linear and nonlinear transformations weighted by alpha.
+
+        :param x: Input tensor.
+        :return: Output tensor from the last activated block.
+        """
+        out = self.first_layer(x)
+        alpha_loss = 0.0
+        # for i in range(self.current_block):
+        for i in range(self.num_layers):
+            layer = self.layers[i] # Pick the corresponding stacked net
+            alpha = self.alpha[i]  # Pick the corresponding alpha for each stacked net
+            linear_out = layer["linear"](out)
+            nonlinear_out = layer["nonlinear"](torch.cat([x, out], dim=1))
+            out = torch.abs(alpha) * nonlinear_out + (1 - torch.abs(alpha)) * linear_out
+            alpha_loss += torch.pow(alpha, 4)
+        self.alpha_loss = alpha_loss
+        return out
+
+    def get_alpha_loss(self):
+        """
+        Retrieve the accumulated loss from alpha parameters used for regularization purposes.
+
+        :return: Alpha loss as a torch scalar.
+        """
+        return self.alpha_loss
+        
 
 class InteractionEmbeddingMLP(nn.Module):
     """
     Multi-Layer Perceptron which is a hypernetwork hidden state embeddings decided by interaction type and concatenated
     to hidden state.
     """
+
     def __init__(
         self,
         insize,
@@ -420,8 +611,12 @@ class InteractionEmbeddingMLP(nn.Module):
         sizes = [insize] + hsizes
         sizes = [size + em_size for size, em_size in zip(sizes, em_sizes)]
         sizes += [outsize]
-        self.nonlin = nn.ModuleList([nonlin() for k in range(self.nhidden)] + [nn.Identity()])
-        self.embeddings = [nn.Embedding(int(n_interactors**2), n_embed) for n_embed in em_sizes]
+        self.nonlin = nn.ModuleList(
+            [nonlin() for k in range(self.nhidden)] + [nn.Identity()]
+        )
+        self.embeddings = [
+            nn.Embedding(int(n_interactors**2), n_embed) for n_embed in em_sizes
+        ]
         self.linear = nn.ModuleList(
             [
                 linear_map(sizes[k], sizes[k + 1], bias=bias, **linargs)
@@ -439,15 +634,18 @@ class InteractionEmbeddingMLP(nn.Module):
         :return: (torch.Tensor, shape=[batchsize, outsize])
         """
         for lin, nlin, embedder in zip(self.linear, self.nonlin, self.embeddings):
-            x = torch.cat([x, embedder(self.n_interactors*i + j)])
+            x = torch.cat([x, embedder(self.n_interactors * i + j)])
             x = nlin(lin(x))
         return x
+
+
 
 
 class MLPDropout(Block):
     """
     Multi-Layer Perceptron with dropout consistent with blocks interface
     """
+
     def __init__(
         self,
         insize,
@@ -457,7 +655,7 @@ class MLPDropout(Block):
         nonlin=SoftExponential,
         hsizes=[64],
         linargs=dict(),
-        dropout=0.0
+        dropout=0.0,
     ):
         """
 
@@ -474,7 +672,9 @@ class MLPDropout(Block):
         self.in_features, self.out_features = insize, outsize
         self.nhidden = len(hsizes)
         sizes = [insize] + hsizes + [outsize]
-        self.nonlin = nn.ModuleList([nonlin() for k in range(self.nhidden)] + [nn.Identity()])
+        self.nonlin = nn.ModuleList(
+            [nonlin() for k in range(self.nhidden)] + [nn.Identity()]
+        )
         self.linear = nn.ModuleList(
             [
                 linear_map(sizes[k], sizes[k + 1], bias=bias, **linargs)
@@ -482,7 +682,10 @@ class MLPDropout(Block):
             ]
         )
         self.dropout = nn.ModuleList(
-            [Dropout(p=dropout) if dropout > 0.0 else nn.Identity() for _ in range(self.nhidden)]
+            [
+                Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
+                for _ in range(self.nhidden)
+            ]
             + [nn.Identity()]
         )
 
@@ -504,6 +707,7 @@ class ResMLP(MLP):
     """
     Residual MLP consistent with the block interface.
     """
+
     def __init__(
         self,
         insize,
@@ -568,15 +772,17 @@ class InputConvexNN(MLP):
     Equation 11 from https://arxiv.org/abs/2001.06116
     """
 
-    def __init__(self,
-                 insize,
-                 outsize,
-                 bias=True,
-                 linear_map=slim.Linear,
-                 nonlin=nn.ReLU,
-                 hsizes=[64],
-                 linargs=dict()
-                 ):
+    def __init__(
+        self,
+        insize,
+        outsize,
+        bias=True,
+        linear_map=slim.Linear,
+        nonlin=nn.ReLU,
+        hsizes=[64],
+        linargs=dict(),
+    ):
+
         super().__init__(
             insize,
             outsize,
@@ -585,10 +791,9 @@ class InputConvexNN(MLP):
             nonlin=nonlin,
             hsizes=hsizes,
             linargs=linargs,
-
         )
         assert (
-                len(set(hsizes)) == 1
+            len(set(hsizes)) == 1
         ), "All hidden sizes should be equal for residual network"
 
         sizes = hsizes + [outsize]
@@ -613,7 +818,9 @@ class InputConvexNN(MLP):
         xi = x
         px = self.inmap(xi)
         x = self.nonlin[0](px)
-        for layer, (linU, nlin, linW) in enumerate(zip(self.poslinear, self.nonlin[1:], self.linear)):
+        for layer, (linU, nlin, linW) in enumerate(
+            zip(self.poslinear, self.nonlin[1:], self.linear)
+        ):
             px = linW(xi)
             ux = linU(x)
             x = nlin(ux + px)
@@ -625,6 +832,7 @@ class PosDef(Block):
     Enforce positive-definiteness of lyapunov function ICNN, V = g(x)
     Equation 12 from https://arxiv.org/abs/2001.06116
     """
+
     def __init__(self, g, max=None, eps=0.01, d=1.0, *args):
         """
 
@@ -637,7 +845,9 @@ class PosDef(Block):
         self.g = g
         self.in_features = self.g.in_features
         self.out_features = self.g.out_features
-        self.zero = torch.nn.Parameter(torch.zeros(1, self.g.in_features), requires_grad=False)
+        self.zero = torch.nn.Parameter(
+            torch.zeros(1, self.g.in_features), requires_grad=False
+        )
         self.eps = eps
         self.d = d
         self.smReLU = SmoothedReLU(self.d)
@@ -645,7 +855,7 @@ class PosDef(Block):
 
     def block_eval(self, x):
         shift_to_zero = self.smReLU(self.g(x) - self.g(self.zero))
-        quad_psd = self.eps*(x**2).sum(1, keepdim=True)
+        quad_psd = self.eps * (x**2).sum(1, keepdim=True)
         z = shift_to_zero + quad_psd
         if self.max is not None:
             z = z - torch.relu(z - self.max)
@@ -767,6 +977,7 @@ class BilinearTorch(Block):
     """
     Wraps torch.nn.Bilinear to be consistent with the blocks interface
     """
+
     def __init__(
         self,
         insize,
@@ -804,6 +1015,7 @@ class Poly2(Block):
     """
     Feature expansion of network to include pairwise multiplications of features.
     """
+
     def __init__(self, *args):
         super().__init__()
 
@@ -825,6 +1037,7 @@ class BasisLinear(Block):
     Takes a linear combination of the expanded features.
 
     """
+
     def __init__(
         self,
         insize,
@@ -863,6 +1076,7 @@ class BasisLinear(Block):
         :return: (torch.Tensor, shape=[batchsize, outsize])
         """
         return self.linear(self.expand(x))
+        
 
 
 class InterpolateAddMultiply(nn.Module):
@@ -870,6 +1084,7 @@ class InterpolateAddMultiply(nn.Module):
     Implementation of smooth interpolation between addition and multiplication
     using soft exponential activation: https://arxiv.org/pdf/1602.01321.pdf
     """
+
     def __init__(self, alpha=0.0, tune_alpha=True):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(alpha), requires_grad=tune_alpha)
@@ -890,5 +1105,8 @@ blocks = {
     "poly2": Poly2,
     "bilinear": BilinearTorch,
     "icnn": InputConvexNN,
-    "pos_def": PosDef
+    "pos_def": PosDef,
+    "kan": KANBlock,
+    "stacked_mlp": StackedMLP
 }
+

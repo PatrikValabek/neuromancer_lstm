@@ -1,6 +1,3 @@
-"""
-
-"""
 # python base imports
 import os
 import pydot
@@ -8,12 +5,145 @@ from itertools import combinations
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 import warnings
+import lightning.pytorch as pl 
 from typing import Dict, List, Callable
+from inspect import signature
 
 # machine learning/data science imports
 import torch
 import torch.nn as nn
 
+
+
+class LitProblem(pl.LightningModule):
+    """
+    A PyTorch-Lightning Module wrapper for the Neuromancer Problem class. 
+    As is customary with LightningModules, steps for training and validation are outlined here, as well as the optimizer
+    Logging metrics are also defined here, such as 'train_loss'. 
+    """
+
+    # Class attrinbute for expected signatures of Lightning hooks
+    expected_signatures = {
+        'backward': '(self, loss)',
+        'on_before_backward': '(self, loss)',
+        'on_after_backward': '(self)',
+        'on_before_zero_grad': '(self, optimizer)',
+        'on_fit_start': '(self)',
+        'on_fit_end': '(self)', 
+        'on_load_checkpoint': '(self, checkpoint)', 
+        'on_save_checkpoint': '(self, checkpoint)', 
+        'on_train_start': '(self)', 
+        'on_train_end': '(self)', 
+        'on_validation_start': '(self)', 
+        'on_validation_end': '(self)', 
+        'on_test_batch_start': '(self, batch, batch_idx, dataloader_idx)', 
+        'on_test_batch_end': '(self, batch, batch_idx, dataloader_idx)', 
+        'on_test_epoch_start': '(self)', 
+        'on_test_epoch_end': '(self)', 
+        'on_test_start': '(self)', 
+        'on_test_end': '(self)', 
+        'on_predict_batch_start': '(self, batch, batch_idx, dataloader_idx)', 
+        'on_predict_batch_end': '(self, batch, batch_idx, dataloader_idx)', 
+        'on_predict_epoch_start': '(self)', 
+        'on_predict_epoch_end': '(self)', 
+        'on_predict_start': '(self)', 
+        'on_predict_end': '(self)', 
+        'on_train_batch_start': '(self, batch, batch_idx)',
+        'on_train_batch_end': '(self, batch, batch_idx)',
+        'on_train_epoch_start': '(self)', 
+        'on_train_epoch_end': '(self)', 
+        'on_validation_batch_start': '(self, batch, batch_idx)',
+        'on_validation_batch_end': '(self, batch, batch_idx)',
+        'on_validation_epoch_start': '(self)', 
+        'on_validation_epoch_end': '(self)', 
+        'configure_model': '(self)'
+
+    }
+
+    def __init__(self, problem, train_metric='train_loss', dev_metric='train_loss', test_metric='train_loss', custom_optimizer=None, 
+                 custom_training_step=None, custom_hooks=None, hparam_config=None):
+        """
+        :param problem: A Neuromancer Problem()
+        :param train_metric: metric to be used during training step. Default to train_loss
+        :param dev_metric: metric to be used during validation step. Default to train_loss
+        :param test_metric: metric to be used during testing step (currently not supported yet)
+        :param custom_optimizer: Optimizer to be used during training. Default is None, in which an 
+                                 Adam optimizer is used with learning rate = 0.001
+        :param custom_training_step: Custom training step function, if desired. Defaults to None, in which case the standard training step procedure is executed
+        :param custom_hooks: Dictionary of custom hook functions that are supported by Lightning. Defaults to None.
+        :param hparam_config: A wandb hyperparameter configuration file. Only used for hyperparameter tuning. 
+        """
+        super().__init__()
+        self.problem = problem
+        self.train_metric = train_metric
+        self.dev_metric = dev_metric
+        self.test_metric = test_metric
+        self.custom_optimizer = custom_optimizer
+        self.custom_training_step = custom_training_step
+        self.custom_hooks = custom_hooks or {}
+        self.hparam_config = hparam_config
+        self.lr = .001
+
+        self.training_step_outputs = []
+        self.validation_step_outputs = []
+
+        
+        self._load_from_config()
+        self._validate_hooks()
+
+    def _load_from_config(self): 
+        if self.hparam_config: 
+            if "learning_rate" in self.hparam_config: 
+                self.lr = self.hparam_config.learning_rate
+    
+    def _validate_hooks(self):
+        for hook_name, hook_func in self.custom_hooks.items():
+            if hook_name in self.expected_signatures:
+                expected_sig = self.expected_signatures[hook_name]
+                actual_sig = str(signature(hook_func))
+                if actual_sig != expected_sig:
+                    raise ValueError(f"Custom hook '{hook_name}' has incorrect signature: expected {expected_sig}, got {actual_sig}")
+    
+    def training_step(self, batch, batch_idx):
+        if self.custom_training_step is not None: 
+            loss = self.custom_training_step(self, batch)
+        else: 
+            output = self.problem(batch)
+            loss = output[self.train_metric]
+        self.training_step_outputs.append(loss)
+        self.log('train_loss', loss, on_epoch=True, enable_graph=True, prog_bar=True)
+        return loss
+
+    def on_train_epoch_end(self):
+        if 'on_train_epoch_end' in self.custom_hooks:
+            self.custom_hooks['on_train_epoch_end'](self)
+        else:
+            epoch_average = torch.stack(self.training_step_outputs).mean()
+            self.log("training_epoch_average", epoch_average) #log to lightning_logs
+            self.training_step_outputs.clear() 
+
+    def validation_step(self, batch, batch_idx):
+        if 'validation_step' in self.custom_hooks: 
+            self.custom_hook['validation_step'](self, batch, batch_idx)
+        else: 
+            output = self.problem(batch)
+            loss = output[self.dev_metric]
+            self.validation_step_outputs.append(loss)
+            self.log('dev_loss', loss, prog_bar=True)
+
+    def configure_optimizers(self):
+        if 'configure_optimizers' in self.custom_hooks:
+            self.custom_hooks['configure_optimizers'](self)
+        else: 
+            if self.custom_optimizer is None: 
+                optimizer = torch.optim.Adam(self.problem.parameters(), self.lr, betas=(0.0, 0.9))
+            else: 
+                optimizer = self.custom_optimizer
+            return optimizer
+    
+    def get_problem(self):
+        return self.problem
+    
 
 class Problem(nn.Module):
     """
@@ -196,6 +326,20 @@ class Problem(nn.Module):
             fig.axes.get_xaxis().set_visible(False)
             fig.axes.get_yaxis().set_visible(False)
             plt.show()
+
+    def freeze(self):
+        """
+        Freezes the parameters of all nodes in the system
+        """
+        for node in self.nodes:
+            node.freeze()
+
+    def unfreeze(self):
+        """
+        Unfreezes the parameters of all nodes in the system
+        """
+        for node in self.nodes:
+            node.unfreeze()
 
     def __repr__(self):
         s = "### MODEL SUMMARY ###\n\nnodeS:"
