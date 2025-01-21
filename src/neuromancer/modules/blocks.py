@@ -9,6 +9,7 @@ import torch.nn as nn
 from abc import ABC, abstractmethod
 
 import neuromancer.slim as slim
+from neuromancer.slim.linear import Linear  # assuming `slim.Linear` is imported this way
 import neuromancer.modules.rnn as rnn
 from neuromancer.modules.activations import soft_exp, SoftExponential, SmoothedReLU
 
@@ -108,6 +109,42 @@ def set_model_dropout_mode(model, at_train=None, at_test=None):
             if at_train is not None: x.at_train = at_train
     model.apply(_apply_fn)
 
+class LSTMBlock(nn.Module):
+    """
+    A block that encapsulates LSTM functionality.
+    """
+    def __init__(self, input_dim, hidden_dim, only_last = True, num_layers=1, bidirectional=False, dropout=0.0):
+        """
+        Initializes the LSTM block.
+        :param input_dim: The number of expected features in the input x
+        :param hidden_dim: The number of features in the hidden state h
+        :param only_last : If True, returns only the last hidden state
+        :param num_layers: Number of recurrent layers (default=1)
+        :param bidirectional: If True, becomes a bidirectional LSTM (default=False)
+        :param dropout: If non-zero, introduces a dropout layer on the outputs of each LSTM layer except the last layer
+        """
+        super(LSTMBlock, self).__init__()
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, num_layers=num_layers,
+                            bidirectional=bidirectional, dropout=dropout, batch_first=True)
+        
+        self.output_dim = hidden_dim * 2 if bidirectional else hidden_dim
+        self.only_last = only_last
+
+    def forward(self, x):
+        """
+        Forward pass through the LSTM block.
+        :param x: Tensor, shape (batch, sequence, feature)
+        :return: output, (h_n, c_n)
+        """
+        output, (h_n, c_n) = self.lstm(x)
+        
+        if self.only_last:
+            return output[:, -1:, :]
+        else:
+            return output
+
+        
+
 
 class MLP(Block):
     """
@@ -159,6 +196,125 @@ class MLP(Block):
             x = nlin(lin(x))
         return x
 
+
+class MonotonicLinear(nn.Module):
+    """
+    Linear layer with non-negative weight constraints for monotonicity.
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(MonotonicLinear, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        # Initialize weights to be positive
+        nn.init.uniform_(self.linear.weight, a=0.0, b=1.0)
+        if bias:
+            nn.init.constant_(self.linear.bias, 0.0)
+
+    def forward(self, x):
+        # Clamp weights to ensure they remain non-negative
+        self.linear.weight.data.clamp_(min=0)
+        return self.linear(x)
+
+class SoftExponential(nn.Module):
+    """
+    A monotonic activation function known as the SoftExponential function.
+    """
+    def __init__(self, alpha=0.1):
+        super(SoftExponential, self).__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        if self.alpha == 0:
+            return x
+        elif self.alpha > 0:
+            return (torch.exp(self.alpha * x) - 1) / self.alpha + self.alpha
+        else:
+            return -torch.log(1 - self.alpha * (x + self.alpha)) / self.alpha
+
+class MonotonicLinear(nn.Module):
+    """
+    Linear layer with non-negative weight constraints for monotonicity.
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(MonotonicLinear, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        # Initialize weights to be positive
+        nn.init.uniform_(self.linear.weight, a=0.0, b=1.0)
+        if bias:
+            nn.init.constant_(self.linear.bias, 0.0)
+
+    def forward(self, x):
+        # Clamp weights to ensure they remain non-negative
+        self.linear.weight.data.clamp_(min=0)
+        return self.linear(x)
+
+class SoftExponential(nn.Module):
+    """
+    A monotonic activation function known as the SoftExponential function.
+    """
+    def __init__(self, alpha=0.1):
+        super(SoftExponential, self).__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        if self.alpha == 0:
+            return x
+        elif self.alpha > 0:
+            return (torch.exp(self.alpha * x) - 1) / self.alpha + self.alpha
+        else:
+            return -torch.log(1 - self.alpha * (x + self.alpha)) / self.alpha
+
+class MLP_Monotonic(nn.Module):
+    """
+    Multi-Layer Perceptron with monotonic constraints.
+    """
+    def __init__(
+        self,
+        insize,
+        outsize,
+        bias=True,
+        linear_map=MonotonicLinear,
+        nonlin=SoftExponential,
+        hsizes=[64],
+    ):
+        """
+        :param insize: (int) Dimensionality of input
+        :param outsize: (int) Dimensionality of output
+        :param bias: (bool) Whether to use bias
+        :param linear_map: (class) Linear map class with monotonic constraints
+        :param nonlin: (callable) Monotonic elementwise nonlinearity
+        :param hsizes: (list of ints) List of hidden layer sizes
+        """
+        super(MLP_Monotonic, self).__init__()
+        self.in_features, self.out_features = insize, outsize
+        self.nhidden = len(hsizes)
+        sizes = [insize] + hsizes + [outsize]
+
+        # Initialize monotonic nonlinearity layers
+        self.nonlin = nn.ModuleList([nonlin() for _ in range(self.nhidden)] + [nn.Identity()])
+        
+        # Initialize monotonic linear layers
+        self.linear = nn.ModuleList(
+            [
+                linear_map(sizes[i], sizes[i + 1], bias=bias)
+                for i in range(self.nhidden + 1)
+            ]
+        )
+
+    def reg_error(self):
+        # Regularization error if any can be accumulated here
+        # Here, it's empty as we aren't applying additional penalties
+        return 0
+
+    def forward(self, x):
+        """
+        Forward pass through the network.
+        
+        :param x: (torch.Tensor, shape=[batchsize, insize])
+        :return: (torch.Tensor, shape=[batchsize, outsize])
+        """
+        for lin, nlin in zip(self.linear, self.nonlin):
+            x = nlin(lin(x))
+        return x
 
 
 def sigmoid_scale(x, min, max):
